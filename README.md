@@ -40,8 +40,11 @@ docker compose up --build
    - `DEMO-05` 单篇仍超限 → `status=failed`，
      `error_code=document_exceeds_vram_limit`，`error_message` 给出显存测算；
    - 其余 7 篇 `succeeded` 并带 `category` / `confidence`。
-3. `GET /jobs/{job_id}/dispatches`：逐篇派发流水（同一 `batch_id` 为同批，
-   可看到 `DEMO-03`、`DEMO-04`、`DEMO-05` 被缩批后重新派发）。
+3. `GET /jobs/{job_id}/dispatches`：派发流水。底层现在**每批只存一条**整批流水
+   （`dispatch_batch_log`，批号/显存上限/时间 + 批内有序 seq/估算 JSON），接口仍
+   **按 ID 顺序逐篇展开**返回原有字段（`dispatches`），并额外给出物理整批视图
+   `batches` 与 `batch_count`。可看到 `DEMO-03`、`DEMO-04`、`DEMO-05` 被缩批后
+   重新派发（同篇重派是另一条整批流水、另一个 ID）。
 4. `PUT /admin/node`：运行中调整显存上限（如 `{"vram_limit_mb": 256,
    "per_doc_delay_ms": 80}`），立即生效且持久化到 SQLite；调大到 4096 后
    再 `POST /jobs/JOB-DEMO-SHRINK/resume` 也不会重跑终态文档
@@ -123,7 +126,8 @@ curl -s http://localhost:8000/jobs/JOB-R-1 | python -m json.tool
    `started=false` + “已有续跑任务在执行”；
 2. 数据层 `Database.claim_next_batch()`：`BEGIN IMMEDIATE` 事务内
    `SELECT ... WHERE status='pending' ... LIMIT n` 后立刻把这些行改成
-   `processing` 并写 `dispatch_log`。即使绕过第一层（多进程/多 worker），
+   `processing`、`attempts + 1`，并写入**一条**整批流水（`dispatch_batch_log`），
+   全部同事务提交、失败整体回滚。即使绕过第一层（多进程/多 worker），
    两个认领事务也会被 SQLite 写锁串行化，**同一篇文档不可能被同时认领两次**。
 
 ---
@@ -177,6 +181,51 @@ loop:
 
 ---
 
+## 3.5 派发流水：每批一条存储，查询仍逐篇返回
+
+值班员用派发流水 ID 区分同一篇文档缩批前后的尝试。旧版本把**批号、显存上限、
+时间逐篇写入** `dispatch_log`（一批 N 篇就 N 行）；现在新派发改成**每批只存一条**。
+
+### 两张表
+
+| 表 | 粒度 | 是否还写入 | 说明 |
+| --- | --- | --- | --- |
+| `dispatch_log` | 一篇文档一行（旧） | 否，仅保留只读 | 接上旧数据卷后历史流水原样可查，旧 ID 原样返回 |
+| `dispatch_batch_log` | 一批派发一行（新） | 是 | 字段：`id`、`job_id`、`batch_id`、`doc_count`、`doc_seqs_json`、`vram_limit_mb`、`dispatched_at` |
+
+- `doc_seqs_json` 是批内逐篇 `[{"seq", "estimate_mb"}, ...]` 的**有序 JSON**。
+  批内文档序号**可能跳号**（已终态的篇被认领查询排除）；缩批后同一篇再次派发，
+  就是**另一条整批流水、另一个 ID**（同篇的多次尝试仍可凭 ID 区分）。
+- 新表 `id` 用 `INTEGER PRIMARY KEY AUTOINCREMENT`：在**全库**按认领提交顺序
+  **严格递增、不复用**，服务重启后**接着编号**（不是从 1 重新开始）。
+
+### 接上旧数据卷（迁移）
+
+启动建表后会执行一次迁移：当旧表 `dispatch_log` 已有行而新表为空时，把新表的
+`AUTOINCREMENT` 序列种子设为旧表最大 ID。因此：
+
+- 旧流水 ID **原样返回**，不会被改写；
+- 第一条新整批流水 ID = 旧表最大 ID + 1，**新旧 ID 永不冲突**，且全库保持递增；
+- 迁移幂等：新表已有数据后重启不会重置序列。
+
+### 查询 API 行为不变（字段兼容）
+
+`GET /jobs/{job_id}/dispatches` 合并两张表并把整批行**逐篇展开**：
+
+- `dispatches`：仍按 `(id, seq)` 顺序、一篇文档一次派发一条，字段与旧版完全一致
+  （`id / seq / batch_id / vram_limit_mb / estimate_mb / dispatched_at`）；
+  同批多篇共享同一个整批 `id`。
+- `dispatch_count`：逐篇条目数（含缩批重派）。
+- `batches` / `batch_count`：新增的物理整批视图与落盘条数，便于核对“每批一条”。
+
+### 认领与流水同一事务
+
+`claim_next_batch()` 在单个 `BEGIN IMMEDIATE` 事务内同时完成：文档
+`pending→processing`、每篇 `attempts + 1`、整批流水插入一条。任一步写入失败，
+三者**一起回滚**（不会出现状态改了但流水没写，或流水写了但没认领成功）。
+
+---
+
 ## 4. 配置（环境变量）
 
 | 变量 | 默认 | 说明 |
@@ -201,7 +250,7 @@ loop:
 | `GET /jobs` | 作业列表与计数 |
 | `GET /jobs/{job_id}` | **按提交顺序**返回每篇状态/分类/错误，以及作业计数、当前批大小、生效显存上限、进程内是否在跑 |
 | `POST /jobs/{job_id}/resume` | 按原作业号续跑；运行中调用安全去重；全终态时返回提示 |
-| `GET /jobs/{job_id}/dispatches` | 派发流水（批次号、当时上限、估算显存、时间），核对缩批/重复派发 |
+| `GET /jobs/{job_id}/dispatches` | 派发流水：`dispatches` 按 ID 顺序逐篇返回原有字段（合并旧表+整批展开），`batches`/`batch_count` 给每批一条的物理整批视图 |
 | `POST /demo/run` | 一键演示“部分成功→缩批→单篇失败→其余完成” |
 | `GET/PUT /admin/node` | 查看/调整显存上限与推理延迟 |
 
@@ -217,7 +266,7 @@ pip install -r requirements.txt
 pip install pytest httpx          # 仅自测需要
 
 uvicorn app.main:app --reload     # http://127.0.0.1:8000/docs
-python -m pytest -q               # 21 个单元/接口/并发/重启测试
+python -m pytest -q               # 30 个单元/接口/并发/重启/流水迁移测试
 
 # 端到端：脚本会自起 uvicorn、跑三大场景、SIGKILL 后重启并并发 resume
 python scripts/selftest.py all
@@ -238,13 +287,13 @@ python scripts/selftest.py remote --base-url http://localhost:8000 \
 ```
 app/
   config.py    # 环境变量配置与显存模型常数
-  db.py        # SQLite schema、原子认领、终态排除、崩溃重置、派发流水
+  db.py        # SQLite schema、原子认领、终态排除、崩溃重置、整批流水(每批一条)+旧库迁移
   node.py      # 模拟分类节点：显存估算、部分结果 + OOM、确定性分类
   runner.py    # 缩批重试循环、单篇失败隔离、RunManager 并发去重
   models.py    # Pydantic schema（/docs 文档）
   demo.py      # 一键演示数据
   main.py      # FastAPI 路由 / lifespan / 序列化
-tests/         # pytest：节点、原子认领与多线程竞争、runner 重启/并发、HTTP API
+tests/         # pytest：节点、原子认领与多线程竞争、runner 重启/并发、HTTP API、整批流水与旧库迁移
 scripts/
   selftest.py  # 零三方依赖的端到端自测（含 SIGKILL 重启 + 8 并发 resume）
 data/          # SQLite bind mount 目录（*.db 已 gitignore）

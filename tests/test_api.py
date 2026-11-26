@@ -91,7 +91,55 @@ def test_demo_endpoint_shrink_and_failure(client):
 
     dr = client.get("/jobs/JOB-DEMO-SHRINK/dispatches")
     assert dr.status_code == 200
-    assert dr.json()["dispatch_count"] >= 8
+    body = dr.json()
+    assert body["dispatch_count"] >= 8
+    # per-document entries keep the original fields and stay id-ordered
+    entries = body["dispatches"]
+    assert all(
+        set(e.keys())
+        == {"id", "seq", "batch_id", "vram_limit_mb",
+            "estimate_mb", "dispatched_at"}
+        for e in entries
+    )
+    assert [e["id"] for e in entries] == sorted(e["id"] for e in entries)
+
+    # one physical batch-ledger row per claim, never per document
+    batches = body["batches"]
+    assert body["batch_count"] == len(batches)
+    assert batches[0]["doc_count"] == 4  # first claim is the full batch of 4
+    assert all(b["doc_count"] >= 1 for b in batches)
+    # every expanded entry maps to a real batch row (or legacy row)
+    batch_ids = {b["id"] for b in batches}
+    new_entries = [e for e in entries if e["id"] in batch_ids]
+    assert sum(b["doc_count"] for b in batches) == len(new_entries)
+
+
+def test_dispatches_merge_legacy_and_new_per_doc_view(client):
+    # A normal job only writes the new batch ledger, yet the API still
+    # expands it into the original per-document response shape.
+    client.post(
+        "/jobs",
+        json={
+            "job_id": "JOB-MERGE",
+            "batch_size": 2,
+            "vram_limit_mb": 4096,
+            "documents": [
+                {"id": "A", "text": "银行金融财报投资"},
+                {"id": "B", "text": "球队比赛进球体育"},
+                {"id": "C", "text": "芯片算法人工智能"},
+            ],
+        },
+    )
+    body = _wait_terminal(client, "JOB-MERGE")
+    assert body["status"] == "completed"
+
+    dr = client.get("/jobs/JOB-MERGE/dispatches").json()
+    # 3 documents claimed in batches of 2 -> two physical batch rows,
+    # but still three per-document entries in the query view.
+    assert dr["batch_count"] == 2
+    assert dr["dispatch_count"] == 3
+    assert [e["seq"] for e in dr["dispatches"]] == [0, 1, 2]
+    assert [b["doc_count"] for b in dr["batches"]] == [2, 1]
 
 
 def test_404_and_validation(client):

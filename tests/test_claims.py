@@ -50,10 +50,12 @@ def test_concurrent_claims_never_overlap(tmp_path):
     assert len(all_seqs) == 20
     assert len(set(all_seqs)) == 20
     assert sorted(all_seqs) == list(range(20))
-    # one dispatch_log row per claimed doc
+    # the query view expands batch rows into one per-document entry
     dispatches = db.list_dispatches("J1")
     assert len(dispatches) == 20
     assert len({(d["seq"], d["id"]) for d in dispatches}) == 20
+    # while the physical ledger holds exactly one row per non-empty claim
+    assert db.count_dispatch_batches("J1") == 7
     db.close()
 
 

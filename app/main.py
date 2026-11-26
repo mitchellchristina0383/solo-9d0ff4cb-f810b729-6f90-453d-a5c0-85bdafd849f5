@@ -347,17 +347,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/jobs/{job_id}/dispatches",
         response_model=DispatchList,
         tags=["jobs"],
-        summary="查看逐篇派发流水（核对缩批与重复派发的证据）",
+        summary="查看派发流水：逐篇视图（原有字段，按 ID 顺序）+ 每批一条的整批视图",
     )
     async def list_dispatches(job_id: str, request: Request) -> dict[str, Any]:
         db: Database = request.app.state.db
         if db.get_job(job_id) is None:
             raise HTTPException(status_code=404, detail=f"作业不存在: {job_id}")
         rows = db.list_dispatches(job_id)
+        batches = db.list_dispatch_batches(job_id)
         return {
             "job_id": job_id,
             "dispatch_count": len(rows),
+            "batch_count": len(batches),
             "dispatches": rows,
+            "batches": batches,
         }
 
     return app

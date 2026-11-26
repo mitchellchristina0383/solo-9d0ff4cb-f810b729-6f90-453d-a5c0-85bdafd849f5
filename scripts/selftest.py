@@ -24,6 +24,7 @@ import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -173,17 +174,60 @@ def scenario_shrink(cli: Client) -> None:
     check(all(d["category"] for d in docs if d["status"] == "succeeded"),
           "成功文档都带分类结果")
 
-    dispatches = cli.get(f"/jobs/{job_id}/dispatches")["dispatches"]
-    first_batch_id = dispatches[0]["batch_id"]
+    dispatches = cli.get(f"/jobs/{job_id}/dispatches")
+    entries = dispatches["dispatches"]
+    batches = dispatches["batches"]
+    first_batch_id = entries[0]["batch_id"]
     first_batch_seqs = sorted(
-        d["seq"] for d in dispatches if d["batch_id"] == first_batch_id
+        d["seq"] for d in entries if d["batch_id"] == first_batch_id
     )
     check(first_batch_seqs == [0, 1, 2, 3],
           f"首次派发为整批 4 篇（实际 seq={first_batch_seqs}）")
     # DEMO-03 (seq2) was in the OOM batch and then re-dispatched smaller.
-    seq2 = [d for d in dispatches if d["seq"] == 2]
+    seq2 = [d for d in entries if d["seq"] == 2]
     check(len(seq2) == 2 and seq2[0]["batch_id"] != seq2[1]["batch_id"],
           "触发 OOM 的未完成文档在更小批次中被重试")
+
+    # New ledger stores ONE row per batch; the per-document query view is
+    # rebuilt by expanding those rows.
+    check(dispatches["batch_count"] == len(batches),
+          "响应 batch_count 与整批流水条数一致")
+    check(all(b["doc_count"] >= 1 for b in batches),
+          "每条整批流水至少派发一篇")
+    check(sum(b["doc_count"] for b in batches)
+          == _count_new_entries(entries, batches),
+          "整批 doc_count 之和等于新流水展开的逐篇条目数")
+    batch_ids = [b["id"] for b in batches]
+    check(batch_ids == sorted(set(batch_ids)),
+          "整批流水 ID 全局递增且不重复")
+    check(batches[0]["doc_count"] == 4,
+          f"首批整批流水 doc_count=4（实际 {batches[0]['doc_count']}）")
+    # Physical storage really is one row per batch, not one per document.
+    # Discover the live DB file from /health (works in local and remote
+    # modes as long as the file is reachable from this host).
+    db_file = cli.get("/health").get("db_path", "")
+    if db_file and os.path.exists(db_file):
+        with sqlite3.connect(db_file) as conn:
+            physical = conn.execute(
+                "SELECT COUNT(*) FROM dispatch_batch_log "
+                "WHERE job_id = ?", (job_id,)
+            ).fetchone()[0]
+            legacy = conn.execute(
+                "SELECT COUNT(*) FROM dispatch_log"
+            ).fetchone()[0]
+        check(physical == len(batches),
+              f"SQLite 实表 dispatch_batch_log 每批一条（物理行数={physical}，"
+              f"批次数={len(batches)}，逐篇派发={len(entries)}）")
+        check(legacy == 0,
+              f"新派发不再写旧表 dispatch_log（旧表行数={legacy}）")
+    else:
+        print(f"{INFO}无法从本机访问 DB 文件({db_file})，"
+              "跳过物理行数直查（接口视图已核验）")
+
+
+def _count_new_entries(entries: list, batches: list) -> int:
+    new_ids = {b["id"] for b in batches}
+    return sum(1 for e in entries if e["id"] in new_ids)
 
 
 def scenario_concurrent_resume(cli: Client, tag: str = "CONC") -> None:
@@ -210,10 +254,19 @@ def scenario_concurrent_resume(cli: Client, tag: str = "CONC") -> None:
 
     job = cli.wait_terminal(job_id)
     check(job["counts"]["succeeded"] == 12, "12 篇全部成功")
-    rows = cli.get(f"/jobs/{job_id}/dispatches")["dispatches"]
+    flow = cli.get(f"/jobs/{job_id}/dispatches")
+    rows = flow["dispatches"]
     seqs = [r["seq"] for r in rows]
     check(sorted(seqs) == list(range(12)) and len(set(seqs)) == 12,
           "每篇文档恰好派发一次，无重复派发")
+    # 12 docs at batch size 4 with no OOM -> exactly 3 physical batch rows,
+    # while the per-document view still lists 12 entries.
+    check(flow["batch_count"] == 3,
+          f"12 篇 / 批大小 4 = 3 条整批流水（实际 {flow['batch_count']}）")
+    check(sum(b["doc_count"] for b in flow["batches"]) == 12,
+          "整批 doc_count 之和 = 12 篇逐篇派发")
+    check([b["id"] for b in flow["batches"]] == sorted(
+        b["id"] for b in flow["batches"]), "整批流水 ID 递增")
     cli.put("/admin/node", {"vram_limit_mb": 512, "per_doc_delay_ms": 0})
 
 
@@ -285,7 +338,8 @@ def scenario_restart_resume(
           f"续跑后作业 completed（实际 {job['status']}）")
     check(job["counts"]["succeeded"] == 16, "16 篇全部成功")
 
-    rows = cli.get(f"/jobs/{job_id}/dispatches")["dispatches"]
+    flow = cli.get(f"/jobs/{job_id}/dispatches")
+    rows = flow["dispatches"]
     new_rows = [r for r in rows if r["id"] > max_dispatch_id]
     leaked = sorted({r["seq"] for r in new_rows} & terminal_before)
     check(not leaked,
@@ -293,7 +347,21 @@ def scenario_restart_resume(
     new_seqs = [r["seq"] for r in new_rows]
     check(len(new_seqs) == len(set(new_seqs)),
           f"并发续跑没有重复派发同一文档（重启后派发 seq={sorted(new_seqs)}）")
-    print(f"{INFO}重启后新派发 {len(new_rows)} 篇：{sorted(set(new_seqs))}")
+
+    # New batch ids keep increasing across the SIGKILL/restart boundary:
+    # every post-restart batch id is strictly above the pre-kill upper bound
+    # and ids remain globally unique (no reset to 1).
+    new_batch_ids = [
+        b["id"] for b in flow["batches"] if b["id"] > max_dispatch_id
+    ]
+    check(bool(new_batch_ids), "重启后产生了新的整批流水")
+    check(all(i > max_dispatch_id for i in new_batch_ids),
+          f"重启后整批流水 ID 接续递增（均 > kill 前上界 {max_dispatch_id}）")
+    all_batch_ids = [b["id"] for b in flow["batches"]]
+    check(len(all_batch_ids) == len(set(all_batch_ids)),
+          "全库整批流水 ID 唯一、不回卷")
+    print(f"{INFO}重启后新派发 {len(new_rows)} 篇：{sorted(set(new_seqs))}；"
+          f"新整批流水 ID={new_batch_ids}")
     cli.put("/admin/node", {"vram_limit_mb": 512, "per_doc_delay_ms": 0})
 
 

@@ -9,10 +9,28 @@ Two hard guarantees live here:
 * Documents that already reached the terminal states (``succeeded`` /
   ``failed``) are never selected by a claim, so restart-and-resume never
   re-dispatches them.
+
+Dispatch flows are stored in two ledgers:
+
+* ``dispatch_log`` -- the legacy per-document table.  It is kept intact so
+  an existing data volume stays fully queryable; new claims never write to
+  it.
+* ``dispatch_batch_log`` -- the current table with exactly **one row per
+  batch** (per claim).  Per-document seq / estimate detail is carried in an
+  ordered JSON array, so gapping seqs and re-dispatch after shrinking are
+  both represented without extra rows.  Its AUTOINCREMENT id increases over
+  the whole database in claim-commit order and continues after a restart;
+  schema migration seeds it past the largest legacy id so old and new ids
+  never collide.
+
+``list_dispatches`` merges both ledgers back into the original per-
+document response shape (ordered by ``(id, seq)``), so the query API keeps
+returning the old fields one entry per dispatched document.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import uuid
@@ -65,8 +83,9 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE INDEX IF NOT EXISTS idx_documents_claim
     ON documents(job_id, status, seq);
 
--- Append-only ledger: one row every time a document is dispatched to the
--- simulated node.  Used by the self-test to prove "no duplicate dispatch".
+-- Legacy append-only ledger (pre-batch-refactor): one row every time a
+-- document was dispatched.  Kept verbatim so an existing data volume keeps
+-- every historical flow queryable; new dispatches no longer write here.
 CREATE TABLE IF NOT EXISTS dispatch_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id          TEXT NOT NULL,
@@ -78,6 +97,27 @@ CREATE TABLE IF NOT EXISTS dispatch_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_dispatch_job ON dispatch_log(job_id, seq);
+
+-- New batch ledger: exactly ONE row per dispatch batch (one claim), no
+-- matter how many documents the batch contains.  Per-document seq / VRAM
+-- estimates live in ``doc_seqs_json`` (submission order; seqs may skip and
+-- a document re-dispatched after shrinking gets another row under a new
+-- batch id).  AUTOINCREMENT (not plain INTEGER PRIMARY KEY) guarantees ids
+-- are strictly increasing over the whole database and never reused after a
+-- restart; a migration step seeds the sequence past every legacy id so new
+-- ids never collide with old ones.
+CREATE TABLE IF NOT EXISTS dispatch_batch_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          TEXT NOT NULL,
+    batch_id        TEXT NOT NULL,
+    doc_count       INTEGER NOT NULL,
+    doc_seqs_json   TEXT NOT NULL,
+    vram_limit_mb   INTEGER NOT NULL,
+    dispatched_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_dispatch_batch_job
+    ON dispatch_batch_log(job_id, id);
 
 CREATE TABLE IF NOT EXISTS node_settings (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
@@ -120,6 +160,33 @@ class Database:
     def init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA_SQL)
+            self._migrate_dispatch_sequence()
+
+    def _migrate_dispatch_sequence(self) -> None:
+        """Hand an existing data volume over to the batch ledger.
+
+        The legacy per-document ``dispatch_log`` stays readable.  When it
+        already holds rows but the new ``dispatch_batch_log`` does not, seed
+        the new table's AUTOINCREMENT sequence past the largest legacy id so
+        new batch ids keep increasing over the whole database and can never
+        collide with an old id.  Runs inside the schema-setup lock at
+        startup, before any claim can insert a batch row.
+        """
+        legacy_max = self._conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM dispatch_log"
+        ).fetchone()["m"]
+        if legacy_max <= 0:
+            return
+        new_count = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM dispatch_batch_log"
+        ).fetchone()["n"]
+        if new_count > 0:
+            return  # migration already done (or a fresh DB already using it)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO sqlite_sequence(name, seq) "
+            "VALUES ('dispatch_batch_log', ?)",
+            (legacy_max,),
+        )
 
     def seed_node_settings(self, vram_limit_mb: int, delay_ms: int) -> None:
         with self._lock:
@@ -315,9 +382,17 @@ class Database:
     ) -> list[dict[str, Any]]:
         """Atomically claim up to ``max_docs`` pending documents.
 
-        Returns the claimed rows in submission order and appends one
-        dispatch_log row per document, all in one immediate transaction.
-        An empty list means there is nothing left to dispatch.
+        Returns the claimed rows in submission order and records exactly one
+        row in the batch ledger (``dispatch_batch_log``) for the whole
+        claim, all in one immediate transaction: document status flips to
+        ``processing``, per-document ``attempts`` increments and the batch
+        flow commit together, so a write failure rolls everything back and
+        no document is left half-claimed.  An empty list means there is
+        nothing left to dispatch.
+
+        Batch-internal seqs may skip (terminal rows are excluded) and a
+        document re-dispatched after shrinking is simply another batch row
+        carrying its seq again.
         """
         batch_id = f"b_{uuid.uuid4().hex[:12]}"
         now = utc_now_iso()
@@ -347,21 +422,25 @@ class Database:
                     f"({','.join('?' for _ in seqs)}) ORDER BY seq ASC",
                     (job_id, *seqs),
                 ).fetchall()
-                self._conn.executemany(
-                    "INSERT INTO dispatch_log (job_id, seq, batch_id, "
-                    "vram_limit_mb, estimate_mb, dispatched_at) "
+                # One ledger row for the entire batch; per-document detail
+                # rides along as an ordered JSON array.
+                doc_entries = [
+                    {"seq": int(d["seq"]),
+                     "estimate_mb": int(d["vram_estimate_mb"])}
+                    for d in docs
+                ]
+                self._conn.execute(
+                    "INSERT INTO dispatch_batch_log (job_id, batch_id, "
+                    "doc_count, doc_seqs_json, vram_limit_mb, dispatched_at) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
-                    [
-                        (
-                            job_id,
-                            d["seq"],
-                            batch_id,
-                            vram_limit_mb,
-                            d["vram_estimate_mb"],
-                            now,
-                        )
-                        for d in docs
-                    ],
+                    (
+                        job_id,
+                        batch_id,
+                        len(doc_entries),
+                        json.dumps(doc_entries, ensure_ascii=False),
+                        vram_limit_mb,
+                        now,
+                    ),
                 )
                 self._conn.execute("COMMIT")
                 result = [dict(d) for d in docs]
@@ -460,14 +539,75 @@ class Database:
                 raise
 
     def list_dispatches(self, job_id: str) -> list[dict[str, Any]]:
+        """Per-document dispatch view, merging legacy and batch ledgers.
+
+        Legacy ``dispatch_log`` rows are returned with their original ids
+        and fields untouched.  Each new ``dispatch_batch_log`` row (one per
+        batch) is expanded into one entry per document it dispatched, all
+        sharing that batch's id.  The merged result is ordered by
+        ``(id, seq)`` -- i.e. claim-commit order over the whole database,
+        then submission order inside a batch -- which preserves the old
+        "one entry per dispatched document, id order" contract.
+        """
         with self._lock:
-            rows = self._conn.execute(
+            legacy_rows = self._conn.execute(
                 "SELECT id, seq, batch_id, vram_limit_mb, estimate_mb, "
                 "dispatched_at FROM dispatch_log "
+                "WHERE job_id = ? ORDER BY id ASC, seq ASC",
+                (job_id,),
+            ).fetchall()
+            batch_rows = self._conn.execute(
+                "SELECT id, batch_id, doc_count, doc_seqs_json, "
+                "vram_limit_mb, dispatched_at FROM dispatch_batch_log "
+                "WHERE job_id = ? ORDER BY id ASC",
+                (job_id,),
+            ).fetchall()
+
+        entries: list[dict[str, Any]] = [dict(r) for r in legacy_rows]
+        for row in batch_rows:
+            try:
+                doc_entries = json.loads(row["doc_seqs_json"])
+            except (ValueError, TypeError):  # defensive: never hide the row
+                doc_entries = []
+            for entry in doc_entries:
+                entries.append(
+                    {
+                        "id": row["id"],
+                        "seq": int(entry["seq"]),
+                        "batch_id": row["batch_id"],
+                        "vram_limit_mb": row["vram_limit_mb"],
+                        "estimate_mb": int(entry["estimate_mb"]),
+                        "dispatched_at": row["dispatched_at"],
+                    }
+                )
+        entries.sort(key=lambda e: (int(e["id"]), int(e["seq"])))
+        return entries
+
+    def list_dispatch_batches(self, job_id: str) -> list[dict[str, Any]]:
+        """The physical batch ledger: one row per dispatch batch."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, job_id, batch_id, doc_count, doc_seqs_json, "
+                "vram_limit_mb, dispatched_at FROM dispatch_batch_log "
                 "WHERE job_id = ? ORDER BY id ASC",
                 (job_id,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def count_dispatch_batches(self, job_id: str | None = None) -> int:
+        """Number of physical batch-ledger rows (whole DB or one job)."""
+        with self._lock:
+            if job_id is None:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM dispatch_batch_log"
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM dispatch_batch_log "
+                    "WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+        return int(row["n"])
 
     def new_owner(self) -> str:
         return f"run-{uuid.uuid4().hex[:12]}"

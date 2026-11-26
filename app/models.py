@@ -170,18 +170,43 @@ class NodeConfigOut(NodeConfig):
 
 
 class DispatchOut(BaseModel):
-    id: int
-    seq: int
+    id: int = Field(
+        ...,
+        description="派发流水 ID：旧数据原样返回；新数据为整批流水 ID，"
+        "全库按认领提交顺序递增、重启后续编，同批多篇共享同一 ID",
+    )
+    seq: int = Field(..., description="批内文档序号（提交顺序下标，可能跳号）")
+    batch_id: str = Field(..., description="批号；同一批号为同一次派发")
+    vram_limit_mb: int = Field(..., description="本次派发时生效的显存上限(MB)")
+    estimate_mb: int = Field(..., description="该篇文档当时的显存估算(MB)")
+    dispatched_at: str = Field(..., description="派发时间(UTC ISO-8601)")
+
+
+class DispatchBatchOut(BaseModel):
+    id: int = Field(..., description="整批流水 ID（全库递增，重启续编）")
     batch_id: str
+    doc_count: int = Field(..., description="本批实际派发的文档条数")
+    doc_seqs_json: str = Field(
+        ..., description="批内逐篇 [seq, estimate_mb] 的有序 JSON（序号可跳号）"
+    )
     vram_limit_mb: int
-    estimate_mb: int
     dispatched_at: str
 
 
 class DispatchList(BaseModel):
     job_id: str
-    dispatch_count: int
-    dispatches: list[DispatchOut]
+    dispatch_count: int = Field(
+        ..., description="逐篇派发条目数（每篇每次派发一条，含缩批重派）"
+    )
+    batch_count: int = Field(
+        ..., description="新整批流水落盘条数（每批只存一条；不含旧库历史行）"
+    )
+    dispatches: list[DispatchOut] = Field(
+        ..., description="按 (id, seq) 顺序逐篇返回的原有流水字段"
+    )
+    batches: list[DispatchBatchOut] = Field(
+        ..., description="新批次流水的物理存储视图（每批一条），用于核对落盘条数"
+    )
 
 
 class Health(BaseModel):
