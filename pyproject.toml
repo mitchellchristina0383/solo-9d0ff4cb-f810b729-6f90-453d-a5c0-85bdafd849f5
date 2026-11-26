@@ -1,0 +1,17 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# Keep the lint surface intentional and reproducible.
+select = ["E4", "E7", "E9", "F", "I", "UP", "SIM", "BLE", "RUF", "PLW1510"]
+ignore = [
+    # Chinese UI/error/test strings intentionally contain full-width punctuation.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]

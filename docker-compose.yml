@@ -1,0 +1,30 @@
+services:
+  classifier-api:
+    build: .
+    image: gsb-classifier-api:1.0.0
+    container_name: gsb-classifier-api
+    # Single instance / single worker by design (see Dockerfile).
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite file inside the bind-mounted volume -> survives restarts.
+      DB_PATH: /app/data/classifier.db
+      # Adjustable simulated GPU memory cap (MB); PUT /admin/node overrides
+      # it at runtime and the value is persisted in SQLite.
+      VRAM_LIMIT_MB: "512"
+      BATCH_SIZE: "4"
+      NODE_DELAY_MS: "80"
+      MODEL_RESIDENT_MB: "128"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
